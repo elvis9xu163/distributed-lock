@@ -1,14 +1,9 @@
-package com.xjd.distributed.lock.zoo2;
+package com.xjd.distributed.lock.zoo;
 
 import java.nio.charset.Charset;
-import java.util.Collections;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.UUID;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -23,7 +18,6 @@ import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.data.Stat;
 
 import com.xjd.distributed.lock.DistributedLockException;
-import com.xjd.distributed.lock.zoo.ZooDistributedLockException;
 import com.xjd.utils.basic.AssertUtils;
 import com.xjd.utils.basic.JsonUtils;
 import com.xjd.utils.basic.StringUtils;
@@ -47,14 +41,16 @@ public class InternalLock {
 	protected volatile int status;
 	protected ReadWriteLock statusLock;
 
-	protected LinkedList<LockNodeInMem> lockedNodes;
+	protected Map<String, LockNodeInMem> lockedNodes;
 
 	protected LinkedList<LockNodeInMem> queueNodes;
 	protected ReadWriteLock queueNodesLock;
+	protected Condition queueNodesWriteLockCondition;
 
 	protected ThreadLocal<LockNodeInMem> threadLocal;
 
 	protected ScheduledExecutorService scheduledExecutorService;
+	protected boolean innerScheduledExecutorService = false;
 
 	protected TreeCache treeCache; // 用于监听zoo节点变化从而控制锁
 
@@ -81,14 +77,16 @@ public class InternalLock {
 		this.status = 0;
 		this.statusLock = new ReentrantReadWriteLock();
 
-		this.lockedNodes = new LinkedList<>();
+		this.lockedNodes = new ConcurrentHashMap<>();
 
 		this.queueNodes = new LinkedList<>();
 		this.queueNodesLock = new ReentrantReadWriteLock();
+		this.queueNodesWriteLockCondition = queueNodesLock.writeLock().newCondition();
 
 		this.threadLocal = new ThreadLocal<>();
 
 		this.scheduledExecutorService = scheduledExecutorService != null ? scheduledExecutorService : Executors.newScheduledThreadPool(2);
+		this.innerScheduledExecutorService = scheduledExecutorService != null ? false : true;
 
 		this.cleanupTaskLock = new ReentrantReadWriteLock();
 	}
@@ -150,11 +148,15 @@ public class InternalLock {
 			}
 
 			// 创建watch
+			log.debug("create tree cache of path '{}'", locksPath);
 			treeCache = new TreeCache(curatorFramework, locksPath);
 			treeCache.getListenable().addListener((client, event) -> {
 				processLocksTreeCacheEvent(event);
 			}, scheduledExecutorService);
 			treeCache.start();
+
+			// 是否需要启动清扫任务
+			startCleanupTask();
 
 		} catch (DistributedLockException e) {
 			throw e;
@@ -178,8 +180,12 @@ public class InternalLock {
 	}
 
 	protected void processLocksTreeCacheEvent(TreeCacheEvent event) {
+		if (log.isTraceEnabled()) {
+			log.trace("TreeCacheEvent: {}", JsonUtils.toJson(event));
+		}
 		switch (event.getType()) {
 		case NODE_REMOVED:
+			lockedNodes.remove(event.getData().getPath());
 			signalQueueNodes();
 			break;
 		case NODE_UPDATED: // 看是否需要启动过期扫描任务
@@ -201,12 +207,19 @@ public class InternalLock {
 		if (cleanupTaskFuture != null) {
 			return;
 		}
+		if (status == 2) { // 已关闭
+			return;
+		}
 		cleanupTaskLock.writeLock().lock();
 		try {
 			if (cleanupTaskFuture != null) {
 				return;
 			}
+			if (status == 2) { // 已关闭
+				return;
+			}
 			// 启动任务
+//			log.debug("starting cleanup task...");
 			Stat locksStat = new Stat();
 			List<String> childNames = curatorFramework.getChildren().storingStatIn(locksStat).forPath(locksPath);
 			if (locksStat.getNumChildren() < maxConcurrent) {
@@ -219,6 +232,7 @@ public class InternalLock {
 			cleanupTaskFuture = scheduledExecutorService.schedule(() -> {
 				doCleanupTask();
 			}, remain, TimeUnit.MILLISECONDS);
+			log.debug("scheduled cleanup task delay: {}ms", remain);
 		} catch (DistributedLockException e) {
 			throw e;
 		} catch (Throwable t) {
@@ -230,6 +244,7 @@ public class InternalLock {
 
 	protected void doCleanupTask() {
 		try {
+			log.debug("exec cleanup task...");
 			Stat locksStat = new Stat();
 			List<String> childNames = curatorFramework.getChildren().storingStatIn(locksStat).forPath(locksPath);
 			Collections.sort(childNames);
@@ -238,7 +253,7 @@ public class InternalLock {
 				long remain = Long.parseLong(parseNames[0]) + maxExpireInMills - System.currentTimeMillis();
 				if (remain <= 0) {
 					// 删除
-					deleteLockNode(childName);
+					deleteLockNode(locksPath + "/" + childName);
 				} else {
 					break;
 				}
@@ -253,10 +268,52 @@ public class InternalLock {
 	}
 
 	public void close() {
-		// 不再进行锁
+		if (status == 2) return;
+		assertRunning();
+		statusLock.writeLock().lock();
+		try {
+			if (status == 2) return;
+			assertRunning();
+			status = 2;
+		} finally {
+			statusLock.writeLock().unlock();
+		}
+
+		log.debug("lock closing...: {}", namespace);
+
+		// 关闭监听
+		treeCache.close();
+
+		// 先换醒所有等待锁的线程, 它们将抛出锁已关闭异常
+		queueNodesLock.writeLock().lock();
+		try {
+			queueNodesWriteLockCondition.signalAll();
+		} finally {
+			queueNodesLock.writeLock().unlock();
+		}
+
 		// 释放全部锁
-		// 锁住队列
-//		treeCache.close();
+		for (String path : lockedNodes.keySet()) {
+			doUnlock(path);
+		}
+
+		// 关闭清理任务
+		if (cleanupTaskFuture != null) {
+			cleanupTaskLock.writeLock().lock();
+			try {
+				if (cleanupTaskFuture != null) {
+					cleanupTaskFuture.cancel(true);
+					cleanupTaskFuture = null;
+				}
+			} finally {
+				cleanupTaskLock.writeLock().unlock();
+			}
+		}
+
+		// 关闭内部调度器
+		if (innerScheduledExecutorService) {
+			scheduledExecutorService.shutdown();
+		}
 	}
 
 	public int getNowConcurrent() {
@@ -283,6 +340,17 @@ public class InternalLock {
 		String[] parseNames = parseLockNodeName(lockNodeInMem.getPath());
 		long remainExpireTime = Long.parseLong(parseNames[0]) + maxExpireInMills - System.currentTimeMillis();
 		return remainExpireTime < 0 ? 0 : remainExpireTime;
+	}
+
+	public boolean isLocked() {
+		LockNodeInMem lockNodeInMem = threadLocal.get();
+		if (lockNodeInMem == null) {
+			return false;
+		}
+		if (lockedNodes.get(lockNodeInMem.getPath()) == null) {
+			return false;
+		}
+		return true;
 	}
 
 	/**
@@ -350,6 +418,8 @@ public class InternalLock {
 				}
 				// 能走到这里说明获取成功了
 				lockNodeInMem.setPath(lockPath);
+				lockedNodes.put(lockPath, lockNodeInMem);
+				log.debug("lock '{}' get lock", lockPath);
 				return true;
 			}
 			return false;
@@ -420,7 +490,8 @@ public class InternalLock {
 				return false;
 			} else {
 				try {
-					return queueNodesLock.writeLock().newCondition().await(remain, TimeUnit.MILLISECONDS);
+					log.debug("lock waiting: {}ms", remain);
+					return queueNodesWriteLockCondition.await(remain, TimeUnit.MILLISECONDS);
 				} catch (InterruptedException e) {
 					if (lockNodeInMem.isInterrupted()) {
 						throw e;
@@ -433,7 +504,8 @@ public class InternalLock {
 		} else if (lockNodeInMem.getWaitingTime() < 0) {
 			// 无限等待
 			try {
-				queueNodesLock.writeLock().newCondition().await();
+				log.debug("lock waiting unlimitly");
+				queueNodesWriteLockCondition.await();
 				return true;
 			} catch (InterruptedException e) {
 				if (lockNodeInMem.isInterrupted()) {
@@ -454,8 +526,13 @@ public class InternalLock {
 			return;
 		}
 		threadLocal.remove();
+		doUnlock(lockNodeInMem.getPath());
+	}
 
-		deleteLockNode(lockNodeInMem.getPath());
+	protected void doUnlock(String path) {
+		log.debug("unlock '{}'", path);
+		lockedNodes.remove(path);
+		deleteLockNode(path);
 	}
 
 	protected void signalQueueNodes() {
@@ -463,7 +540,7 @@ public class InternalLock {
 			queueNodesLock.writeLock().lock();
 			try {
 				if (!queueNodes.isEmpty()) {
-					queueNodesLock.writeLock().newCondition().signal();
+					queueNodesWriteLockCondition.signal();
 				}
 			} finally {
 				queueNodesLock.writeLock().unlock();
@@ -473,6 +550,7 @@ public class InternalLock {
 
 	protected void deleteLockNode(String path) {
 		try {
+			log.debug("deleting lock node: {}", path);
 			curatorFramework.delete().forPath(path);
 			signalQueueNodes();
 		} catch (KeeperException.NoNodeException e) {

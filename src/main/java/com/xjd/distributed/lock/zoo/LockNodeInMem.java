@@ -1,4 +1,4 @@
-package com.xjd.distributed.lock.zoo2;
+package com.xjd.distributed.lock.zoo;
 
 import java.util.concurrent.TimeUnit;
 

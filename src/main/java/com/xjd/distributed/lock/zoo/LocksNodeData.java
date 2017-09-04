@@ -13,11 +13,8 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 @Setter
 @Builder
 @NoArgsConstructor
-@AllArgsConstructor
-@EqualsAndHashCode
+//@AllArgsConstructor
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(JsonInclude.Include.NON_NULL)
-public class LockConfig {
-	protected int maxConcurrent;
-	protected long maxExpireInMills;
+public class LocksNodeData {
 }

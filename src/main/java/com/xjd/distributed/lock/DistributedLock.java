@@ -7,7 +7,7 @@ import java.util.concurrent.locks.Condition;
  * @author elvis.xu
  * @since 2017-08-29 17:16
  */
-public interface DistributedLock extends ConcurrentableLock {
+public interface DistributedLock extends ConcurrentableLock, AutoCloseable {
 	/**
 	 * Get the maximum expire time in milliseconds of one lock
 	 * @return
@@ -20,6 +20,12 @@ public interface DistributedLock extends ConcurrentableLock {
 	 */
 	long getExpireInMills();
 
+	/**
+	 * Get the lock status
+	 * @return {@code true} if locked, {@code false} otherwise.
+	 */
+	boolean isLocked();
+
 	@Override
 	boolean tryLock(long time, TimeUnit unit);
 
@@ -29,4 +35,12 @@ public interface DistributedLock extends ConcurrentableLock {
 	default Condition newCondition() {
 		throw new UnsupportedOperationException();
 	}
+
+	/**
+	 * start the lock
+	 */
+	void start();
+
+	@Override
+	void close();
 }

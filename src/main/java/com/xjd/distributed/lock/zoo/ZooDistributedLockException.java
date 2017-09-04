@@ -1,6 +1,7 @@
 package com.xjd.distributed.lock.zoo;
 
-import com.xjd.distributed.lock2.DistributedLockException;
+
+import com.xjd.distributed.lock.DistributedLockException;
 
 /**
  * @author elvis.xu
