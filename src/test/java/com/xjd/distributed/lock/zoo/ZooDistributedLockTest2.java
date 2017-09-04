@@ -11,7 +11,7 @@ import com.xjd.distributed.lock.DistributedLocks;
  * @author elvis.xu
  * @since 2017-09-04 14:40
  */
-public class ZooDistributedLockExample2 {
+public class ZooDistributedLockTest2 {
 
 	public static void main(String[] args) throws InterruptedException {
 		CuratorFramework curatorFramework = CuratorUtils.startCuratorFramework();
