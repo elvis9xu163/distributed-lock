@@ -1,562 +1,538 @@
 package com.xjd.distributed.lock.zoo;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.Charset;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import lombok.extern.slf4j.Slf4j;
 
 import org.apache.curator.framework.CuratorFramework;
-import org.apache.curator.framework.api.transaction.CuratorTransactionResult;
 import org.apache.curator.framework.recipes.cache.TreeCache;
 import org.apache.curator.framework.recipes.cache.TreeCacheEvent;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
-import org.apache.zookeeper.data.Stat;
 
 import com.xjd.distributed.lock.DistributedLockException;
-import com.xjd.utils.basic.AssertUtils;
-import com.xjd.utils.basic.JsonUtils;
-import com.xjd.utils.basic.StringUtils;
+import com.xjd.utils.basic.LockUtils;
+import com.xjd.utils.basic.lock.ABLock;
+import com.xjd.utils.basic.lock.impl.StateABLock;
 
 /**
  * @author elvis.xu
- * @since 2017-09-04 09:40
+ * @since 2017-10-12 15:33
  */
 @Slf4j
 public class InternalLock {
-	protected String namespace;
-	protected String path;
+	public static final Charset DEFAULT_CHARSET = Charset.forName("utf8");
+
+	protected LockTree lockTree;
 	protected CuratorFramework curatorFramework;
-	protected int maxConcurrent;
-	protected long maxExpireInMills;
-
-	protected String realmPath;
-	protected String locksPath;
-
-	/** 0-latent(not start); 1-started; 2-closed */
-	protected volatile int status;
-	protected ReadWriteLock statusLock;
-
-	protected Map<String, LockNodeInMem> lockedNodes;
-
-	protected LinkedList<LockNodeInMem> queueNodes;
-	protected ReadWriteLock queueNodesLock;
-	protected Condition queueNodesWriteLockCondition;
-
-	protected ThreadLocal<LockNodeInMem> threadLocal;
-
+	protected ExecutorService executorService;
 	protected ScheduledExecutorService scheduledExecutorService;
-	protected boolean innerScheduledExecutorService = false;
+	protected TreeCache treeCache;
 
-	protected TreeCache treeCache; // 用于监听zoo节点变化从而控制锁
+	protected String lockerPath;
 
-	protected ScheduledFuture cleanupTaskFuture;  // 用于清扫过期的锁
-	protected ReadWriteLock cleanupTaskLock;
+	protected Map<String, LockTree.LocalNode> localNodeMap;
+	protected Lock localNodeMapLock;
+	protected Map<String, LockTree.LocalLock> localLockMap;
+	protected ABLock localLockMapABLock;
+	protected ThreadLocal<Map<String, LockTree.LocalLock>> localLockThreadLocal;
 
-	public InternalLock(String namespace, String path, CuratorFramework curatorFramework, int maxConcurrent, long maxExpireInMills, ScheduledExecutorService scheduledExecutorService) {
-		AssertUtils.assertArgumentNonBlank(path, "path can not be blank.");
-		AssertUtils.assertArgumentNonNull(curatorFramework, "curatorFramework can not be null.");
-		AssertUtils.assertArgumentGreaterEqualThan(maxConcurrent, 1, "maxConcurrent must greater than 0");
-		AssertUtils.assertArgumentGreaterEqualThan(maxExpireInMills, 1, "maxExpireInMills must greater than 0");
-		if (!path.startsWith("/")) {
-			throw new IllegalArgumentException("path must be a valid zoo path");
-		}
-		this.namespace = StringUtils.trimToEmpty(namespace);
-		this.path = path;
+	protected InternalLock(String rootPath, CuratorFramework curatorFramework) {
 		this.curatorFramework = curatorFramework;
-		this.maxConcurrent = maxConcurrent;
-		this.maxExpireInMills = maxExpireInMills;
-
-		this.realmPath = this.path;
-		this.locksPath = this.realmPath + "/locks";
-
-		this.status = 0;
-		this.statusLock = new ReentrantReadWriteLock();
-
-		this.lockedNodes = new ConcurrentHashMap<>();
-
-		this.queueNodes = new LinkedList<>();
-		this.queueNodesLock = new ReentrantReadWriteLock();
-		this.queueNodesWriteLockCondition = queueNodesLock.writeLock().newCondition();
-
-		this.threadLocal = new ThreadLocal<>();
-
-		this.scheduledExecutorService = scheduledExecutorService != null ? scheduledExecutorService : Executors.newScheduledThreadPool(2);
-		this.innerScheduledExecutorService = scheduledExecutorService != null ? false : true;
-
-		this.cleanupTaskLock = new ReentrantReadWriteLock();
-	}
-
-	protected void assertNotClosed() {
-		if (status == 2) {
-			throw new ZooDistributedLockException.LockClosedException();
-		}
-	}
-
-	protected void assertRunning() {
-		if (status != 1) {
-			throw new ZooDistributedLockException.LockNotRunningException();
-		}
-	}
-
-	public void start() {
-		assertNotClosed();
-		if (status != 0) return;
-		statusLock.writeLock().lock();
+		lockTree = new LockTree(rootPath);
+		String ip = "";
 		try {
-			assertNotClosed();
-			if (status != 0) return;
-			doStart();
-			status = 1;
-		} finally {
-			statusLock.writeLock().unlock();
+			ip = InetAddress.getLocalHost().getHostAddress();
+		} catch (UnknownHostException e) {
+			log.warn("can not get the local ip address.");
 		}
+		lockerPath = lockTree.getLockersPath() + "/" + ip + "_" + UUID.randomUUID().toString().replace("-", "");
 	}
 
-
-	protected void doStart() {
+	protected void start() {
+		// 初始化node结构哦
 		try {
-			RealmNodeConfig realmNodeConfig = RealmNodeConfig.builder().maxConcurrent(maxConcurrent).maxExpireInMills(maxExpireInMills).build();
-
-			Stat realmStat = curatorFramework.checkExists().forPath(realmPath);
-			// 节点不存在, 创建之
-			if (realmStat == null) {
-				try {
-					curatorFramework.transaction().forOperations(
-							curatorFramework.transactionOp().create().withMode(CreateMode.PERSISTENT).forPath(realmPath, JsonUtils.toJson(realmNodeConfig).getBytes(Charset.forName("UTF-8"))),
-							curatorFramework.transactionOp().create().withMode(CreateMode.PERSISTENT).forPath(locksPath, JsonUtils.toJson(new LocksNodeData()).getBytes(Charset.forName("UTF-8")))
-					);
-				} catch (KeeperException.NodeExistsException e) {
-					// 已被其它锁创建
-				}
-			}
-
-			// 判断并比较现有节点的配置是否一致
-			realmStat = new Stat();
-			RealmNodeConfig existRealmNodeConfig;
-			try {
-				existRealmNodeConfig = getPathData(realmPath, realmStat, RealmNodeConfig.class);
-			} catch (JsonUtils.JsonException e) {
-				throw new ZooDistributedLockException("path '" + realmPath + "' is not a lock.");
-			}
-			if (!realmNodeConfig.equals(existRealmNodeConfig)) {
-				throw new DistributedLockException.ConfigNotMatchException("the config of this lock does not match the config of zoo lock path '" + realmPath + "'");
-			}
-
-			// 创建watch
-			log.debug("create tree cache of path '{}'", locksPath);
-			treeCache = new TreeCache(curatorFramework, locksPath);
-			treeCache.getListenable().addListener((client, event) -> {
-				processLocksTreeCacheEvent(event);
-			}, scheduledExecutorService);
-			treeCache.start();
-
-			// 是否需要启动清扫任务
-			startCleanupTask();
-
-		} catch (DistributedLockException e) {
-			throw e;
-		} catch (Exception e) {
-			throw new ZooDistributedLockException("init lock '" + realmPath + "' failed.", e);
-		}
-	}
-
-	protected <T> T getPathData(String path, Stat stat, Class<T> clazz) throws Exception {
-		byte[] data = null;
-		if (stat == null) {
-			data = curatorFramework.getData().forPath(path);
-		} else {
-			data = curatorFramework.getData().storingStatIn(stat).forPath(path);
-		}
-		String dataTxt = new String(data, Charset.forName("UTF-8"));
-		if (clazz.isAssignableFrom(String.class)) {
-			return (T) dataTxt;
-		}
-		return JsonUtils.fromJson(dataTxt, clazz);
-	}
-
-	protected void processLocksTreeCacheEvent(TreeCacheEvent event) {
-		if (log.isTraceEnabled()) {
-			log.trace("TreeCacheEvent: {}", JsonUtils.toJson(event));
-		}
-		switch (event.getType()) {
-		case NODE_REMOVED:
-			lockedNodes.remove(event.getData().getPath());
-			signalQueueNodes();
-			break;
-		case NODE_UPDATED: // 看是否需要启动过期扫描任务
-			if (event.getData().getPath().equals(locksPath) && event.getData().getStat().getNumChildren() >= maxConcurrent) {
-				startCleanupTask();
-			}
-			break;
-		case CONNECTION_SUSPENDED:
-		case CONNECTION_LOST:
-			log.warn("zookeeper connection suspended or lost, the lock may invalid: {}", JsonUtils.toJson(event));
-			break;
-		case CONNECTION_RECONNECTED:
-			log.info("zookeeper connection reconnected: {}", JsonUtils.toJson(event));
-			break;
-		}
-	}
-
-	protected void startCleanupTask() {
-		if (cleanupTaskFuture != null) {
-			return;
-		}
-		if (status == 2) { // 已关闭
-			return;
-		}
-		cleanupTaskLock.writeLock().lock();
-		try {
-			if (cleanupTaskFuture != null) {
-				return;
-			}
-			if (status == 2) { // 已关闭
-				return;
-			}
-			// 启动任务
-//			log.debug("starting cleanup task...");
-			Stat locksStat = new Stat();
-			List<String> childNames = curatorFramework.getChildren().storingStatIn(locksStat).forPath(locksPath);
-			if (locksStat.getNumChildren() < maxConcurrent) {
-				return;
-			}
-			Collections.sort(childNames);
-			String[] parseNames = parseLockNodeName(childNames.get(0));
-			long remain = Long.parseLong(parseNames[0]) + maxExpireInMills - System.currentTimeMillis();
-			remain = remain < 0 ? 0 : remain;
-			cleanupTaskFuture = scheduledExecutorService.schedule(() -> {
-				doCleanupTask();
-			}, remain, TimeUnit.MILLISECONDS);
-			log.debug("scheduled cleanup task delay: {}ms", remain);
-		} catch (DistributedLockException e) {
-			throw e;
-		} catch (Throwable t) {
-			throw new ZooDistributedLockException(t);
-		} finally {
-			cleanupTaskLock.writeLock().unlock();
-		}
-	}
-
-	protected void doCleanupTask() {
-		try {
-			log.debug("exec cleanup task...");
-			Stat locksStat = new Stat();
-			List<String> childNames = curatorFramework.getChildren().storingStatIn(locksStat).forPath(locksPath);
-			Collections.sort(childNames);
-			for (String childName : childNames) {
-				String[] parseNames = parseLockNodeName(childNames.get(0));
-				long remain = Long.parseLong(parseNames[0]) + maxExpireInMills - System.currentTimeMillis();
-				if (remain <= 0) {
-					// 删除
-					deleteLockNode(locksPath + "/" + childName);
-				} else {
-					break;
-				}
-			}
-		} catch (DistributedLockException e) {
-			throw e;
-		} catch (Throwable t) {
-			throw new ZooDistributedLockException(t);
-		}
-		cleanupTaskFuture = null;
-		startCleanupTask();
-	}
-
-	public void close() {
-		if (status == 2) return;
-		assertRunning();
-		statusLock.writeLock().lock();
-		try {
-			if (status == 2) return;
-			assertRunning();
-			status = 2;
-		} finally {
-			statusLock.writeLock().unlock();
-		}
-
-		log.debug("lock closing...: {}", namespace);
-
-		// 关闭监听
-		treeCache.close();
-
-		// 先换醒所有等待锁的线程, 它们将抛出锁已关闭异常
-		queueNodesLock.writeLock().lock();
-		try {
-			queueNodesWriteLockCondition.signalAll();
-		} finally {
-			queueNodesLock.writeLock().unlock();
-		}
-
-		// 释放全部锁
-		for (String path : lockedNodes.keySet()) {
-			doUnlock(path);
-		}
-
-		// 关闭清理任务
-		if (cleanupTaskFuture != null) {
-			cleanupTaskLock.writeLock().lock();
-			try {
-				if (cleanupTaskFuture != null) {
-					cleanupTaskFuture.cancel(true);
-					cleanupTaskFuture = null;
-				}
-			} finally {
-				cleanupTaskLock.writeLock().unlock();
-			}
-		}
-
-		// 关闭内部调度器
-		if (innerScheduledExecutorService) {
-			scheduledExecutorService.shutdown();
-		}
-	}
-
-	public int getNowConcurrent() {
-		assertRunning();
-		Stat stat = null;
-		try {
-			stat = curatorFramework.checkExists().forPath(locksPath);
-		} catch (Exception e) {
-			throw new ZooDistributedLockException("", e);
-		}
-		return stat.getNumChildren();
-	}
-
-	protected String[] parseLockNodeName(String name) {
-		return name.substring(name.lastIndexOf('/') + 1).split("_", 3);
-	}
-
-	public long getExpireInMills() {
-		assertRunning();
-		LockNodeInMem lockNodeInMem = threadLocal.get();
-		if (lockNodeInMem == null) {
-			return -1;
-		}
-		String[] parseNames = parseLockNodeName(lockNodeInMem.getPath());
-		long remainExpireTime = Long.parseLong(parseNames[0]) + maxExpireInMills - System.currentTimeMillis();
-		return remainExpireTime < 0 ? 0 : remainExpireTime;
-	}
-
-	public boolean isLocked() {
-		LockNodeInMem lockNodeInMem = threadLocal.get();
-		if (lockNodeInMem == null) {
-			return false;
-		}
-		if (lockedNodes.get(lockNodeInMem.getPath()) == null) {
-			return false;
-		}
-		return true;
-	}
-
-	/**
-	 * @param time        小于0表无限等待, 0表立即返回, 大于0为具体时间
-	 * @param unit
-	 * @param interrupted
-	 * @return
-	 * @throws InterruptedException
-	 */
-	public boolean lock(long time, TimeUnit unit, boolean interrupted) throws InterruptedException {
-		assertRunning();
-		if (threadLocal.get() != null) {
-			return true;
-		}
-		LockNodeInMem lockNodeInMem = new LockNodeInMem().setInterrupted(interrupted).setWaitingTime(time).setWaitingTimeUnit(unit);
-		threadLocal.set(lockNodeInMem);
-		try {
-			return lock(lockNodeInMem);
-		} catch (Throwable t) {
-			threadLocal.remove();
-			if (t instanceof InterruptedException) {
-				throw (InterruptedException) t;
-			} else if (t instanceof RuntimeException) {
-				throw (RuntimeException) t;
-			} else {
-				// impossible
-				throw new RuntimeException(t);
-			}
-		}
-	}
-
-	protected boolean lock(LockNodeInMem lockNodeInMem) throws InterruptedException {
-		assertRunning();
-		// 尝试立即获取
-		if (lockImmediatly(lockNodeInMem)) {
-			return true; // 获取成功
-		}
-
-		// 是否不想等待
-		if (lockNodeInMem.getWaitingTime() == 0L) {
-			return false;
-		}
-
-		// 在队列中等待获取锁
-		return lockInQueue(lockNodeInMem);
-	}
-
-	protected boolean lockImmediatly(LockNodeInMem lockNodeInMem) {
-		try {
-			Stat locksStat = new Stat();
-			LocksNodeData locksData = getPathData(locksPath, locksStat, LocksNodeData.class);
-			if (locksStat.getNumChildren() < maxConcurrent) {
-				// 当前锁节点数小于最大允许并发锁数, 尝试锁
-				String lockPath = getLockNodePath();
-				List<CuratorTransactionResult> results;
-				try {
-					results = curatorFramework.transaction().forOperations(
-							curatorFramework.transactionOp().create().withTtl(maxExpireInMills).withMode(CreateMode.PERSISTENT_WITH_TTL).forPath(lockPath),
-							curatorFramework.transactionOp().setData().withVersion(locksStat.getVersion()).forPath(locksPath, JsonUtils.toJson(locksData).getBytes(Charset.forName("UTF-8")))
-					);
-				} catch (KeeperException.BadVersionException e) {
-					// 有并发，再试
-					lockNodeInMem.setRetryTimes(lockNodeInMem.getRetryTimes() + 1);
-					return lockImmediatly(lockNodeInMem);
-				}
-				// 能走到这里说明获取成功了
-				lockNodeInMem.setPath(lockPath);
-				lockedNodes.put(lockPath, lockNodeInMem);
-				log.debug("lock '{}' get lock", lockPath);
-				return true;
-			}
-			return false;
-		} catch (Throwable t) {
-			throw new ZooDistributedLockException(t);
-		}
-	}
-
-	protected boolean lockInQueue(LockNodeInMem lockNodeInMem) throws InterruptedException {
-		boolean retry = false;
-		queueNodesLock.writeLock().lock();
-		try {
-			// 先入队列
-			queueNodes.addLast(lockNodeInMem);
-
-			Stat locksStat = new Stat();
-			LocksNodeData locksData = getPathData(locksPath, locksStat, LocksNodeData.class);
-			if (locksStat.getNumChildren() < maxConcurrent) {
-				// 当前锁节点数小于最大允许并发锁数, 重试
-				queueNodes.removeLast();
-				retry = true;
-
-			} else {
-				// 需要等待
-				boolean awaitResult = awaitQueueNodesLock(lockNodeInMem);
-				if (!awaitResult) {
-					// 时间耗尽没有通知
-					queueNodes.remove(lockNodeInMem);
-					return false;
-
-				} else {
-					queueNodes.remove(lockNodeInMem);
-					retry = true;
-				}
-			}
-
-		} catch (InterruptedException e) {
-			throw e;
-
+			curatorFramework.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT).forPath(lockTree.getLocksPath());
+		} catch (KeeperException.NodeExistsException e) { // 已存在
+			// do-nothing
 		} catch (Exception e) {
 			throw new ZooDistributedLockException(e);
-
-		} finally {
-			queueNodesLock.writeLock().unlock();
+		}
+		try {
+			curatorFramework.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT).forPath(lockTree.getLockersPath());
+		} catch (KeeperException.NodeExistsException e) { // 已存在
+			// do-nothing
+		} catch (Exception e) {
+			throw new ZooDistributedLockException(e);
 		}
 
-		if (retry) {
-			lockNodeInMem.setRetryTimes(lockNodeInMem.getRetryTimes() + 1);
-			return lock(lockNodeInMem);
-		} else {
-			return false;
+		// 注册自己的lockerPath哦
+		try {
+			curatorFramework.create().withMode(CreateMode.EPHEMERAL).forPath(lockerPath);
+		} catch (Exception e) {
+			throw new ZooDistributedLockException(e);
+		}
+
+		executorService = Executors.newSingleThreadExecutor(); // 单线程更新哦
+		scheduledExecutorService = Executors.newSingleThreadScheduledExecutor();
+		localNodeMap = new HashMap<>();
+		localNodeMapLock = new ReentrantLock();
+		localLockMap = new ConcurrentHashMap<>();
+		localLockMapABLock = new StateABLock();
+		localLockThreadLocal = new ThreadLocal<>();
+
+		// 启动监听 不用等待完成
+		treeCache = new TreeCache(curatorFramework, lockTree.getPath());
+		treeCache.getListenable().addListener((client, event) -> {
+			processTreeCacheEvent(client, event);
+		}, this.executorService);
+		try {
+			treeCache.start();
+		} catch (Exception e) {
+			throw new ZooDistributedLockException(e);
+		}
+		log.info("zoo distributed lock {} started!", lockerPath);
+	}
+
+	protected void close() {
+		// 释放所有锁
+		for (LockTree.LocalLock localLock : localLockMap.values()) {
+			try {
+				cancel(localLock);
+			} catch (Exception e) {
+				log.error("", e);
+			}
+		}
+
+		// 删除lockerPath
+		try {
+			curatorFramework.delete().forPath(lockerPath);
+		} catch (Exception e) {
+			log.error("", e);
+		}
+
+		treeCache.close();
+		scheduledExecutorService.shutdown();
+		executorService.shutdown();
+
+		localNodeMap = null;
+		localNodeMapLock = null;
+		localLockMap = null;
+		localLockMapABLock = null;
+		localLockThreadLocal = null;
+		log.info("zoo distributed lock {} closed!", lockerPath);
+	}
+
+	protected void processTreeCacheEvent(CuratorFramework client, TreeCacheEvent event) {
+		if (log.isTraceEnabled()) {
+			log.trace("zoo distributed lock {} event: {}", lockTree.getPath(), event);
+		}
+		switch (event.getType()) {
+		case NODE_ADDED:
+		case NODE_UPDATED:
+		case NODE_REMOVED:
+			syncNode(event);
+			break;
+		case INITIALIZED:
+		case CONNECTION_SUSPENDED:
+		case CONNECTION_LOST:
+			// XJD 重建TreeCache
+		case CONNECTION_RECONNECTED:
+			// do-nothing
+			break;
 		}
 	}
 
-	protected String getLockNodePath() {
-		return locksPath + "/" + System.currentTimeMillis() + "_" + namespace + "_" + UUID.randomUUID().toString().replace("-", "");
+	protected void syncNode(TreeCacheEvent event) {
+		String path = event.getData().getPath();
+		String name = null;
+		switch (judgeNodePos(path)) {
+		case 0: // root
+			name = name == null ? "root" : name;
+		case 1: // locks
+			name = name == null ? "locks" : name;
+		case 4: // lockers
+			name = name == null ? "lockers" : name;
+			if (event.getType() == TreeCacheEvent.Type.NODE_REMOVED) {
+				log.error("zoo distributed lock " + name + " path [" + path + "] has been removed, attention!!!");
+				throw new ZooDistributedLockException("zoo distributed lock " + name + " path [" + path + "] has been removed, attention!!!");
+			}
+			break;
+
+		case 2: // lock node
+			LockTree.LockNode lockNode = lockTree.getLockNodeMap().get(path);
+			if (event.getType() == TreeCacheEvent.Type.NODE_REMOVED) {
+				if (lockNode != null && !lockNode.getLockLeafMap().isEmpty()) {
+					String txt = "zoo distributed lock lock path [" + path + "] has been removed, but it has children locally " + Arrays.toString(lockNode.getLockLeafMap().keySet().toArray()) + ", attention!!!";
+					log.error(txt);
+					throw new ZooDistributedLockException(txt);
+				}
+				if (lockNode != null) {
+					lockTree.getLockNodeMap().remove(path);
+				}
+			} else {
+				if (lockNode == null) {
+					lockNode = new LockTree.LockNode(path);
+					lockTree.getLockNodeMap().put(path, lockNode);
+				}
+				break;
+			}
+			break;
+
+		case 3: // lock leaf
+			syncLockLeaf(event);
+			break;
+
+		case 5: // locker leaf
+			if (event.getType() == TreeCacheEvent.Type.NODE_REMOVED && path.equals(lockerPath)) {
+				log.warn("zoo distributed lock locker path of self [" + path + "] has been removed, attention!");
+			}
+			break;
+		case -1: // unknown
+			log.debug("unknown path: {}", path);
+			break;
+		}
 	}
 
 	/**
-	 * @param lockNodeInMem
-	 * @return {@code false} 为等待超时, {@code true} 为接到换醒信号
-	 * @throws InterruptedException
+	 * @param path
+	 * @return -1--unknown, 0-root, 1-locks, 2-lock node(locks's children), 3-lock node's children, 4-lockers, 5-lockers's children
 	 */
-	protected boolean awaitQueueNodesLock(LockNodeInMem lockNodeInMem) throws InterruptedException {
-		if (lockNodeInMem.getWaitingTime() > 0) {
-			long remain = lockNodeInMem.getCreateTimeInMills() + lockNodeInMem.getWaitingTimeUnit().toMillis(lockNodeInMem.getWaitingTime()) - System.currentTimeMillis();
-			if (remain <= 0) { // 等待超时了
-				return false;
+	protected int judgeNodePos(String path) {
+		if (path == null) return -1;
+
+		if (path.startsWith(lockTree.getLocksPath())) {
+			if (path.length() == lockTree.getLocksPath().length()) {
+				return 1;
 			} else {
-				try {
-					log.debug("lock waiting: {}ms", remain);
-					return queueNodesWriteLockCondition.await(remain, TimeUnit.MILLISECONDS);
-				} catch (InterruptedException e) {
-					if (lockNodeInMem.isInterrupted()) {
-						throw e;
-					} else {
-						return awaitQueueNodesLock(lockNodeInMem);
+				if (path.substring(lockTree.getLocksPath().length()).lastIndexOf('/') == 0) {
+					return 2;
+				} else {
+					return 3;
+				}
+			}
+		} else if (path.startsWith(lockTree.getLockersPath())) {
+			if (path.length() == lockTree.getLockersPath().length()) {
+				return 4;
+			} else {
+				return 5;
+			}
+		} else if (path.equals(lockTree.getPath())) {
+			return 0;
+		}
+		return -1;
+	}
+
+	protected LockTree.LockNode getRefLockNode(String path) {
+		int index = path.lastIndexOf('/');
+		if (index == lockTree.getLocksPath().length()) {
+			return lockTree.getLockNodeMap().get(path);
+		} else {
+			return lockTree.getLockNodeMap().get(path.substring(0, index));
+		}
+	}
+
+	protected void syncLockLeaf(TreeCacheEvent event) {
+		String path = event.getData().getPath();
+		if (event.getType() == TreeCacheEvent.Type.NODE_UPDATED) return; // 不处理update事件
+
+		LockTree.LockNode refLockNode = getRefLockNode(path);
+		refLockNode.setLockLeafCount(event.getType() == TreeCacheEvent.Type.NODE_ADDED ? refLockNode.getLockLeafCount() + 1 : refLockNode.getLockLeafCount() - 1);
+		LockTree.LocalNode localNode = localNodeMap.get(refLockNode.getPath());
+
+		if (event.getType() == TreeCacheEvent.Type.NODE_ADDED) {
+			// 与本地比对啦, 有就要设置排名，并看能不能取得锁啊
+			LockTree.LocalLock localLock = getLocalLockWithLock(path, localLockMapABLock.lockA());
+			if (localLock == null) { // 本地没有对应的
+				// do-nothing
+			} else { // 本地有对应的
+				// 添加lockLeaf并设置排名
+				LockTree.LockLeaf lockLeaf = new LockTree.LockLeaf(path);
+				lockLeaf.setRanking(refLockNode.getLockLeafCount());
+				lockLeaf.setLocalLock(localLock);
+				refLockNode.getLockLeafMap().put(path, lockLeaf);
+				processLock(localNode, lockLeaf);
+				localLock.getInitLatch().countDown(); // 初始化完成
+			}
+
+		} else {
+			// 与本地比对啦, 有就要把锁改为非锁定状态啦
+			// 修改本地其它的排名，并看能不能取得锁啊
+			LockTree.LockLeaf lockLeaf = refLockNode.getLockLeafMap().get(path);
+			Iterator<Map.Entry<String, LockTree.LockLeaf>> iterator = refLockNode.getLockLeafMap().entrySet().iterator();
+			boolean found = false;
+			while (iterator.hasNext()) {
+				Map.Entry<String, LockTree.LockLeaf> entry = iterator.next();
+				LockTree.LockLeaf otherLeaf = entry.getValue();
+				if (found) {
+					otherLeaf.setRanking(otherLeaf.getRanking() - 1);
+					// 处理本节点
+					processLock(localNode, otherLeaf);
+					continue;
+				}
+				if (lockLeaf != null) {
+					if (lockLeaf == otherLeaf) {
+						found = true;
+					}
+				} else {
+					if (path.compareTo(otherLeaf.getPath()) < 0) {
+						found = true;
+						otherLeaf.setRanking(otherLeaf.getRanking() - 1);
+						// 处理本节点
+						processLock(localNode, otherLeaf);
 					}
 				}
 			}
-
-		} else if (lockNodeInMem.getWaitingTime() < 0) {
-			// 无限等待
-			try {
-				log.debug("lock waiting unlimitly");
-				queueNodesWriteLockCondition.await();
-				return true;
-			} catch (InterruptedException e) {
-				if (lockNodeInMem.isInterrupted()) {
-					throw e;
-				} else {
-					return awaitQueueNodesLock(lockNodeInMem);
-				}
+			if (lockLeaf != null) {
+				processUnLock(lockLeaf);
+				refLockNode.getLockLeafMap().remove(path);
+				localLockMap.remove(path);
 			}
 
-		} else {
+		}
+	}
+
+	protected void processLock(LockTree.LocalNode localNode, LockTree.LockLeaf lockLeaf) {
+		LockTree.LocalLock localLock = lockLeaf.getLocalLock();
+		if (lockLeaf.getRanking() <= localNode.getMaxConcurrent()) {
+			if (localLock.getStatus() >= 2) return;
+			try (LockUtils.LockResource lr = LockUtils.lock(localLock.getStatusLock())) {
+				if (localLock.getStatus() >= 2) return;
+				localLock.setStatus(2);
+				if (log.isDebugEnabled()) {
+					log.debug("zoo distributed lock {} locked!", localLock.getPath());
+				}
+				// 过期时间任务
+				if (localLock.getExpireInMillis() > 0) {
+					localLock.setExpireTaskFuture(scheduledExecutorService.schedule(() -> {
+						expire(localLock);
+					}, localLock.getExpireInMillis(), TimeUnit.MILLISECONDS));
+				}
+			}
+			localLock.getLockLatch().countDown();
+
+		}
+	}
+
+	protected void processUnLock(LockTree.LockLeaf lockLeaf) {
+		try (LockUtils.LockResource lr = LockUtils.lock(lockLeaf.getLocalLock().getStatusLock())) {
+			if (lockLeaf.getLocalLock().getStatus() >= 3) return;
+			lockLeaf.getLocalLock().setStatus(3);
+		}
+	}
+
+	protected void expire(LockTree.LocalLock localLock) {
+		try (LockUtils.LockResource lr = LockUtils.lock(localLock.getStatusLock())) {
+			if (localLock.getStatus() >= 3) return;
+			localLock.setStatus(5);
+		}
+		try {
+			curatorFramework.delete().forPath(localLock.getPath());
+		} catch (KeeperException.NoNodeException e) {
+			// do-nothing
+		} catch (Exception e) {
+			throw new ZooDistributedLockException(e);
+		}
+		if (log.isDebugEnabled()) {
+			log.debug("zoo distributed lock {} expired!", localLock.getPath());
+		}
+	}
+
+	protected LockTree.LocalLock getLocalLockWithLock(String path, Lock lock) {
+		try (LockUtils.LockResource lr = LockUtils.lock(lock)) {
+			LockTree.LocalLock localLock = localLockMap.get(path);
+			return localLock;
+		}
+	}
+
+	/**
+	 * @param name            the identified name for the lock, so different locks should have different names.
+	 * @param timeoutInMillis the timeout in milliseconds before getting the lock. {@code <0} means waiting infinitely;
+	 *                        {@code 0} means trying to get the lock immediately.
+	 * @param expireInMillis  the expire time in milliseconds of the lock. {@code <=0} means unlimited.
+	 * @param maxConcurrent   the max number lock to have the lock in meantime. it must be positive number.
+	 * @param maxQueue        the max number lock to wait in queue for the lock. {@code <0} means unlimited; {@code 0} means no queue.
+	 * @param interrupted     {@code true} means interrupted.
+	 * @return {@code true} if locked, {@code false} otherwise.
+	 */
+	protected boolean lock(String name, long timeoutInMillis, long expireInMillis, int maxConcurrent, int maxQueue, boolean interrupted) throws InterruptedException {
+		// 为name对应的LockNode设置配置信息，若已有则比对配置，目前要求同一个应用内的配置是一样的，跨应用可以不一样（需要业务自己保证配置一致性，不作校验）
+		String nodePath = lockTree.getLocksPath() + "/" + namePreprocess(name);
+		LockTree.LocalNode newNode = new LockTree.LocalNode(nodePath, maxConcurrent, maxQueue);
+		LockTree.LocalNode localNode = localNodeMap.get(nodePath);
+		if (localNode == null) {
+			try (LockUtils.LockResource lr = LockUtils.lock(localNodeMapLock)) {
+				localNode = localNodeMap.get(nodePath);
+				if (localNode == null) {
+					localNode = newNode;
+					localNodeMap.put(nodePath, localNode);
+				}
+			}
+		}
+		if (!localNode.equals(newNode)) {
+			throw new DistributedLockException.ConfigNotMatchException("lock path: " + nodePath + ", expected: " + localNode.toString() + ", but: " + newNode.toString());
+		}
+
+		LockTree.LockNode lockNode = lockTree.getLockNodeMap().get(nodePath);
+		// 看看数量有没有超标，超限直接返回喽
+		if (lockNode != null && maxQueue >= 0 && lockNode.getLockLeafCount() >= (maxConcurrent + maxQueue)) {
 			return false;
 		}
-	}
 
-	public void unlock() {
-		LockNodeInMem lockNodeInMem = threadLocal.get();
-		if (lockNodeInMem == null) {
-			return;
-		}
-		threadLocal.remove();
-		doUnlock(lockNodeInMem.getPath());
-	}
-
-	protected void doUnlock(String path) {
-		log.debug("unlock '{}'", path);
-		lockedNodes.remove(path);
-		deleteLockNode(path);
-	}
-
-	protected void signalQueueNodes() {
-		if (!queueNodes.isEmpty()) {
-			queueNodesLock.writeLock().lock();
+		// 选初始化LockNode节点哦
+		if (lockNode == null) { // 增加点性能
 			try {
-				if (!queueNodes.isEmpty()) {
-					queueNodesWriteLockCondition.signal();
-				}
-			} finally {
-				queueNodesLock.writeLock().unlock();
+				curatorFramework.create().withMode(CreateMode.PERSISTENT).forPath(nodePath);
+			} catch (KeeperException.NodeExistsException e) { // 已存在
+				// do-nothing
+			} catch (Exception e) {
+				throw new ZooDistributedLockException(e);
 			}
 		}
+
+		LockTree.LocalLock localLock = new LockTree.LocalLock();
+		try (LockUtils.LockResource lr = LockUtils.lock(localLockMapABLock.lockB())) {
+			try {
+				String path = curatorFramework.create().withMode(CreateMode.EPHEMERAL_SEQUENTIAL).forPath(nodePath + "/" + LockTree.LockLeaf.NAME_PREFIX);
+				localLock.setPath(path);
+				localLock.setExpireInMillis(expireInMillis);
+				localLockMap.put(path, localLock);
+				Map<String, LockTree.LocalLock> tmpMap = localLockThreadLocal.get();
+				if (tmpMap == null) {
+					tmpMap = new HashMap<>();
+					localLockThreadLocal.set(tmpMap);
+				}
+				tmpMap.put(nodePath, localLock);
+			} catch (Exception e) {
+				throw new ZooDistributedLockException(e);
+			}
+		}
+
+		try {
+			localLock.getInitLatch().await(1, TimeUnit.SECONDS); // 无论如何总得等人家初始化一下吧，要不然你来锁什么
+		} catch (InterruptedException e) {
+			// do-nothing
+		}
+
+		long start = System.currentTimeMillis();
+		long remain = timeoutInMillis;
+		InterruptedException exception = null;
+		while (true) {
+			try {
+				if (timeoutInMillis < 0) {
+					localLock.getLockLatch().await();
+					break;
+				} else {
+					remain = remain - (System.currentTimeMillis() - start);
+					localLock.getLockLatch().await(remain, TimeUnit.MILLISECONDS);
+					break;
+				}
+			} catch (InterruptedException e) {
+				if (interrupted) {
+					exception = e;
+					break;
+				}
+			}
+		}
+
+
+		boolean cancel = false;
+		if (exception != null) {
+			cancel = true;
+		} else {
+			try (LockUtils.LockResource lr = LockUtils.lock(localLock.getStatusLock())) {
+				if (localLock.getStatus() != 2) { // 未lock
+					cancel = true;
+				}
+			}
+		}
+
+		if (cancel) {
+			localLockThreadLocal.get().remove(nodePath);
+			cancel(localLock);
+		}
+
+		if (exception != null) throw exception;
+
+		return cancel ? false : true;
 	}
 
-	protected void deleteLockNode(String path) {
-		try {
-			log.debug("deleting lock node: {}", path);
-			curatorFramework.delete().forPath(path);
-			signalQueueNodes();
-		} catch (KeeperException.NoNodeException e) {
-			// do-nothing  已删除
-		} catch (Exception e) {
-			new ZooDistributedLockException(e);
+	protected void cancel(LockTree.LocalLock localLock) {
+		try (LockUtils.LockResource lr = LockUtils.lock(localLock.getStatusLock())) {
+			int status = localLock.getStatus();
+			localLock.setStatus(4);
+			if (status >= 3) return;
 		}
+		try {
+			curatorFramework.delete().forPath(localLock.getPath());
+		} catch (KeeperException.NoNodeException e) {
+			// do-nothing
+		} catch (Exception e) {
+			throw new ZooDistributedLockException(e);
+		}
+		Future future = localLock.getExpireTaskFuture();
+		if (future != null) {
+			future.cancel(true);
+		}
+		if (log.isDebugEnabled()) {
+			log.debug("zoo distributed lock {} cancelled!", localLock.getPath());
+		}
+	}
+
+	protected void unlock(String name) {
+		Map<String, LockTree.LocalLock> map = localLockThreadLocal.get();
+		if (map == null) return;
+		String nodePath = lockTree.getLocksPath() + "/" + namePreprocess(name);
+		LockTree.LocalLock localLock = map.get(nodePath);
+		if (localLock == null) return;
+
+		localLockThreadLocal.get().remove(nodePath);
+
+		try (LockUtils.LockResource lr = LockUtils.lock(localLock.getStatusLock())) {
+			if (localLock.getStatus() >= 3) return;
+			localLock.setStatus(3);
+		}
+
+		try {
+			curatorFramework.delete().forPath(localLock.getPath());
+		} catch (KeeperException.NoNodeException e) {
+			// do-nothing
+		} catch (Exception e) {
+			throw new ZooDistributedLockException(e);
+		}
+
+		Future future = localLock.getExpireTaskFuture();
+		if (future != null) {
+			future.cancel(true);
+		}
+
+		if (log.isDebugEnabled()) {
+			log.debug("zoo distributed lock {} unlocked!", localLock.getPath());
+		}
+	}
+
+
+	protected String namePreprocess(String name) {
+		if (name == null) return name;
+		return name.replace('/', ':');
+	}
+
+	protected boolean isLocked(String name) {
+		Map<String, LockTree.LocalLock> map = localLockThreadLocal.get();
+		if (map == null) return false;
+		String nodePath = lockTree.getLocksPath() + "/" + namePreprocess(name);
+		LockTree.LocalLock localLock = map.get(nodePath);
+		if (localLock == null) return false;
+
+		try (LockUtils.LockResource lr = LockUtils.lock(localLock.getStatusLock())) {
+			if (localLock.getStatus() == 2) return true;
+		}
+		return false;
 	}
 }

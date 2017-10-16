@@ -5,10 +5,11 @@ import com.xjd.distributed.lock.DistributedLockException;
 
 /**
  * @author elvis.xu
- * @since 2017-08-30 14:40
+ * @since 2017-10-11 15:31
  */
 public class ZooDistributedLockException extends DistributedLockException {
-	public ZooDistributedLockException() {}
+	public ZooDistributedLockException() {
+	}
 
 	public ZooDistributedLockException(String message) {
 		super(message);
@@ -24,10 +25,5 @@ public class ZooDistributedLockException extends DistributedLockException {
 
 	public ZooDistributedLockException(String message, Throwable cause, boolean enableSuppression, boolean writableStackTrace) {
 		super(message, cause, enableSuppression, writableStackTrace);
-	}
-
-	public static class LockClosedException extends ZooDistributedLockException {
-	}
-	public static class LockNotRunningException extends ZooDistributedLockException {
 	}
 }

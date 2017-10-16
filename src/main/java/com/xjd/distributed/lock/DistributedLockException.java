@@ -30,5 +30,10 @@ public class DistributedLockException extends RuntimeException {
 		}
 	}
 
+	public static class LockClosedException extends DistributedLockException {
+	}
+
+	public static class LockNotRunningException extends DistributedLockException {
+	}
 
 }
