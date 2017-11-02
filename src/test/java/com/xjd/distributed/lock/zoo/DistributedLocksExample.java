@@ -26,7 +26,7 @@ public class DistributedLocksExample {
 		client.start();
 
 		{
-			DistributedLock lock = DistributedLocks.getLock(client, "/lockPath");
+			DistributedLock lock = DistributedLocks.getMutexLock(client, "/lockPath");
 			try (LockUtils.LockResource lr = LockUtils.lock(lock)) {
 				System.out.println("AAA");
 			}
@@ -43,7 +43,7 @@ public class DistributedLocksExample {
 		ZooDistributedLocker zooDistributedLocker = new ZooDistributedLocker("/lockPath2", client);
 		zooDistributedLocker.start();
 		{
-			DistributedLock lock = DistributedLocks.getLock(zooDistributedLocker, "ALOCK", 60000L, 1, 100);
+			DistributedLock lock = DistributedLocks.getConcurrentLock(zooDistributedLocker, "ALOCK", 60000L, 1, 100);
 			try (LockUtils.LockResource lr = LockUtils.lock(lock)) {
 				System.out.println("CCC");
 			}
